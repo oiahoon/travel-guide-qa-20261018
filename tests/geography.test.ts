@@ -1,0 +1,47 @@
+import {readFileSync} from 'node:fs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {countryOf,inScope,visitArea,statusPrefix,projection,featurePath,chinaMapParts,mapFeatures,sichuanCities,type MapFeature} from '../lib/geography.ts';
+import {emptyJournal,appendVisit,visitInput,journalSchema,sharedJournal} from '../lib/travel-data.ts';
+import {buildPoster,posterFormats} from '../lib/travel-poster.ts';
+const f:MapFeature={properties:{id:1,name:'架空地区',code:'US'},geometry:{coordinates:[[[[-2,-2],[2,-2],[2,2],[-2,2],[-2,-2]]]]}};
+const visit={id:'synthetic-visit-01',prefecture:'架空地区',city:'合成城市',place:'不应导出的私人地点',date:'2026-01-02'};
+const payload={...visit,placeKey:'synthetic-place',kind:'place',note:'不应导出的笔记',depth:0,prefDepth:0,cityDepth:0,eaten:false,photos:[],location:null};
+test('old records default to Japan; additive country survives journal parsing',()=>{const j=emptyJournal('synthetic');appendVisit(j,'synthetic',visitInput.parse(payload));const raw=JSON.parse(JSON.stringify(j));delete raw.checkins[0].country;assert.equal(journalSchema.parse(raw).checkins[0].country,'JP');appendVisit(j,'synthetic',visitInput.parse({...payload,id:'synthetic-visit-02',country:'CN',prefecture:'四川省',city:'成都市'}));const parsed=journalSchema.parse(j);assert.equal(parsed.checkins[1].country,'CN');assert.equal(parsed.checkins.length,2);});
+test('Sichuan visits appear in China and world without duplication in Japan',()=>{const v={...visit,country:'CN',prefecture:'四川省',city:'合成城市'};assert.ok(inScope(v,'sichuan'));assert.ok(inScope(v,'china'));assert.ok(inScope(v,'world'));assert.equal(inScope(v,'japan'),false);assert.equal(visitArea(v,'sichuan'),'合成城市');assert.equal(countryOf(visit),'JP');assert.equal(statusPrefix('CN','同名地区'),'CN / 同名地区');assert.equal(statusPrefix('JP','同名地区'),'同名地区');});
+test('global coordinates retain mandatory consent and finite bounds',()=>{const location={confirmed:true,latitude:-1,longitude:-1,source:'manual'};const b=visitInput.parse({...payload,country:'US',location});assert.equal(b.location?.latitude,-1);assert.throws(()=>visitInput.parse({...payload,country:'US',location:{...location,confirmed:false}}));for(const latitude of [NaN,91,-91])assert.throws(()=>visitInput.parse({...payload,country:'US',location:{...location,latitude}}));assert.throws(()=>visitInput.parse({...payload,location}));assert.equal(visitInput.parse({...payload,country:'CN',location:null}).location,null);});
+test('non-Japan retry remains idempotent and status labels stay separated',()=>{const j=emptyJournal('synthetic'),cn=visitInput.parse({...payload,country:'CN',published:true});appendVisit(j,'synthetic',visitInput.parse(payload));assert.ok(appendVisit(j,'synthetic',cn)===false);const second={...cn,id:'synthetic-visit-02'};appendVisit(j,'synthetic',second);appendVisit(j,'synthetic',second);assert.equal(j.checkins.length,2);assert.ok(j.statuses.some(s=>s.label==='CN / 架空地区'));const publicData=sharedJournal(j);assert.equal(publicData.checkins.length,1);assert.equal(publicData.checkins[0].country,'CN');assert.ok(publicData.statuses.every(s=>s.scope==='place'||s.label.startsWith('CN / ')));});
+test('poster escapes titles, omits private detail and coordinates by default',()=>{const v={...visit,country:'US',latitude:-1,longitude:-1};const svg=buildPoster({scope:'world',features:[f],visits:[v],title:'<script>&"',format:'phone'});assert.ok(svg.includes('&lt;script&gt;&amp;&quot;'));assert.ok(!svg.includes(visit.place));assert.ok(!svg.includes('synthetic-visit'));assert.ok(!svg.includes('<circle'));assert.ok(svg.includes('1 次到访'));const precise=buildPoster({scope:'world',features:[f],visits:[v],title:'合成地图',format:'phone',precise:true});assert.ok(precise.includes('<circle'));for(const format of Object.keys(posterFormats) as (keyof typeof posterFormats)[]){const out=buildPoster({scope:'world',features:[f],visits:[],title:'空地图',format});assert.ok(out.includes(`width="${posterFormats[format].width}"`));assert.ok(out.includes('0 次到访'));assert.ok(!out.includes('NaN'));}});
+test('projection supports negative and extreme coordinates without invalid paths',()=>{const p=projection([f],220,150);assert.ok(featurePath(f,p).startsWith('M'));assert.ok(!featurePath(f,p).includes('NaN'));assert.ok(p([-1,-1]).every(Number.isFinite));});
+
+const china=JSON.parse(readFileSync(new URL('../public/china-simple.json',import.meta.url),'utf8')).features as MapFeature[];
+const sichuan=JSON.parse(readFileSync(new URL('../public/sichuan-cities.json',import.meta.url),'utf8')).features as MapFeature[];
+test('Sichuan contains exactly the 21 selectable prefectures with valid geometry',()=>{assert.equal(sichuan.length,21);assert.deepEqual(new Set(sichuan.map(f=>f.properties.name)),new Set(sichuanCities));assert.equal(mapFeatures('sichuan',{japan:[],china,world:[],sichuan}),sichuan);for(const f of sichuan){assert.ok(f.geometry.coordinates.length);assert.ok(!featurePath(f,projection(sichuan,900,600)).includes('NaN'));}});
+test('China retains 34 areas and Xisha polygons appear in an inset without shrinking the mainland',()=>{assert.equal(china.length,34);const {main,islands}=chinaMapParts(china);assert.equal(main.length,34);assert.equal(islands.length,1);assert.equal(islands[0].properties.name,'海南省');assert.equal(islands[0].geometry.coordinates.length,18);assert.ok(main.find(f=>f.properties.name==='海南省')!.geometry.coordinates.every(p=>p.some(r=>r.some(pt=>pt[1]>=18))));const svg=buildPoster({scope:'china',features:china,visits:[],title:'合成中国地图',format:'print'});assert.ok(svg.includes('西沙群岛'));assert.ok(svg.includes('非同比例'));assert.ok(!svg.includes('NaN'));assert.ok(!svg.includes('<circle'));});
+test('Sichuan poster colors only the explicitly recorded city',()=>{const features=[{...f,properties:{id:1,name:'合成甲市'}},{...f,properties:{id:2,name:'合成乙市'}}];const svg=buildPoster({scope:'sichuan',features,visits:[{...visit,country:'CN',prefecture:'四川省',city:'合成甲市'}],title:'合成地图',format:'print'});assert.equal((svg.match(/<path[^>]*fill="#b15b40"/g)||[]).length,1);assert.equal((svg.match(/<path[^>]*fill="#aeb0a2"/g)||[]).length,1);});
+
+const chengdu=JSON.parse(readFileSync(new URL('../public/chengdu-districts.json',import.meta.url),'utf8')).features as MapFeature[];
+test('Chengdu district scope requires an explicit Chengdu visit and preserves legacy records',()=>{
+ const v={...visit,country:'CN',prefecture:'四川省',city:'成都市',district:'锦江区'};
+ assert.ok(inScope(v,'chengdu'));assert.equal(inScope({...v,city:'绵阳市'},'chengdu'),false);assert.equal(inScope({...v,country:'JP'},'chengdu'),false);
+ assert.equal(visitArea(v,'chengdu',chengdu),'锦江区');assert.equal(visitArea({...v,district:undefined},'chengdu',chengdu),'');
+ const j=emptyJournal('synthetic');appendVisit(j,'synthetic',visitInput.parse({...payload,...v}));assert.equal(journalSchema.parse(j).checkins[0].district,'锦江区');
+ const raw=JSON.parse(JSON.stringify(j));delete raw.checkins[0].district;assert.equal(journalSchema.parse(raw).checkins[0].district,'');
+ assert.equal(chengdu.length,20);assert.equal(new Set(chengdu.map(f=>f.properties.name)).size,20);
+ const svg=buildPoster({scope:'chengdu',features:chengdu,visits:[v],title:'合成区县地图',format:'phone'});assert.ok(svg.includes('1 个区县'));assert.ok(svg.includes('2017'));assert.ok(svg.includes('openstreetmap.org/copyright'));assert.equal((svg.match(/<path[^>]*fill="#b15b40"/g)||[]).length,1);assert.ok(!svg.includes('NaN'));
+});
+
+test('Chengdu photos use district clipping and never fall back to the entire city',async()=>{
+ const {photoAreas,puzzleSVG}=await import('../lib/photo-puzzle.ts');const district=chengdu.find(f=>f.properties.name==='锦江区')!;
+ const v={...visit,country:'CN',prefecture:'四川省',city:'成都市',district:'锦江区'};const photos=[{id:'synthetic-photo-01',checkin:v.id,url:'data:image/jpeg;base64,synthetic'}];
+ assert.equal(photoAreas('chengdu',chengdu,[v],photos)[0].feature,district);
+ assert.equal(photoAreas('chengdu',chengdu,[{...v,district:''}],photos).length,0);
+ const svg=puzzleSVG({scope:'chengdu',features:chengdu,visits:[v],photos,project:projection(chengdu,900,600),prefix:'test'});assert.equal((svg.match(/<image /g)||[]).length,1);assert.ok(svg.includes('clip-path='));assert.ok(!svg.includes('NaN'));
+});
+
+test('separate photo confirmations append independent visits with isolated dates and retries',()=>{
+ const j=emptyJournal('synthetic');
+ for(const [id,digest] of [['synthetic-photo-01','a'],['synthetic-photo-02','b']])j.photos.push({id,owner:'synthetic',checkin:null,sha:'a'.repeat(40),digest,created:'2026-01-01'});
+ const a=visitInput.parse({...payload,id:'synthetic-visit-01',date:'2024-01-02',photos:['synthetic-photo-01']}),b=visitInput.parse({...payload,id:'synthetic-visit-02',date:'2024-02-03',photos:['synthetic-photo-02']});
+ appendVisit(j,'synthetic',a);assert.equal(j.photos[1].checkin,null);appendVisit(j,'synthetic',b);assert.equal(appendVisit(j,'synthetic',b),false);assert.deepEqual(j.checkins.map(c=>c.date),['2024-01-02','2024-02-03']);assert.deepEqual(j.photos.map(p=>p.checkin),['synthetic-visit-01','synthetic-visit-02']);assert.throws(()=>appendVisit(j,'another-owner',b));
+});
